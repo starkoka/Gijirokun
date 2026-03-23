@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+from datetime import datetime
+
+import discord
+
+from .config import BotConfig
+from .formatting import format_markdown_minutes
+from .gemini import GeminiSummarizer
+from .models import MeetingArtifacts, MeetingMetadata, Participant, TranscriptionJob
+from .transcriber import TranscriptCache, TranscriptionPipeline, VoskTranscriber, write_pcm_wav
+from .voice import StreamingTranscriptSink
+
+LOGGER = logging.getLogger(__name__)
+
+
+class MeetingSession:
+    def __init__(
+        self,
+        *,
+        bot: discord.Bot,
+        config: BotConfig,
+        guild: discord.Guild,
+        voice_channel: discord.VoiceChannel | discord.StageChannel,
+        text_channel_id: int,
+        transcriber: VoskTranscriber,
+        summarizer: GeminiSummarizer,
+    ) -> None:
+        self._bot = bot
+        self._config = config
+        self._guild = guild
+        self._voice_channel = voice_channel
+        self.text_channel_id = text_channel_id
+        self._transcriber = transcriber
+        self._summarizer = summarizer
+        self._order_lock = threading.Lock()
+        self._next_order = 1
+        self._completion_future: asyncio.Future[MeetingArtifacts] = asyncio.get_running_loop().create_future()
+
+        self.started_at = datetime.now(self._config.timezone)
+        self.ended_at = self.started_at
+        self.session_dir = self._config.data_root / "sessions" / self._session_key
+        self.chunks_dir = self.session_dir / "chunks"
+        self.transcript_path = self.session_dir / "transcript_cache.txt"
+        self.minutes_path = self.session_dir / "minutes.md"
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.chunks_dir.mkdir(parents=True, exist_ok=True)
+
+        self.cache = TranscriptCache(self.transcript_path)
+        self.pipeline = TranscriptionPipeline(transcriber=self._transcriber, cache=self.cache)
+        self.participants = _collect_participants(
+            self._voice_channel.members,
+            bot_user_id=self._bot.user.id if self._bot.user else None,
+        )
+        self.sink = StreamingTranscriptSink(
+            silence_timeout_seconds=self._config.silence_timeout_seconds,
+            timezone=self._config.timezone,
+            segment_order_factory=self.next_segment_order,
+            segment_handler=self.handle_segment,
+            should_record_user=self.should_record_user,
+        )
+
+    @property
+    def completion_future(self) -> asyncio.Future[MeetingArtifacts]:
+        return self._completion_future
+
+    @property
+    def _session_key(self) -> str:
+        return f"{self._guild.id}_{self.started_at.strftime('%Y%m%d_%H%M%S')}"
+
+    def next_segment_order(self) -> int:
+        with self._order_lock:
+            value = self._next_order
+            self._next_order += 1
+        return value
+
+    def mark_stop_requested(self) -> None:
+        self.ended_at = datetime.now(self._config.timezone)
+
+    def should_record_user(self, user_id: int) -> bool:
+        member = self._guild.get_member(user_id)
+        return not bool(member and member.bot)
+
+    def handle_segment(self, order: int, speaker_id: int, started_at: datetime, payload: bytes) -> None:
+        speaker_name = self.resolve_speaker_name(speaker_id)
+        if speaker_name is None:
+            return
+        segment_path = self.chunks_dir / f"{order:05d}_{speaker_id}.wav"
+        write_pcm_wav(segment_path, payload)
+        self.pipeline.submit(
+            TranscriptionJob(
+                order=order,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+                started_at=started_at,
+                segment_path=segment_path,
+            )
+        )
+
+    def resolve_speaker_name(self, speaker_id: int) -> str | None:
+        member = self._guild.get_member(speaker_id)
+        if member is not None:
+            if member.bot:
+                return None
+            return member.display_name
+        user = self._bot.get_user(speaker_id)
+        if user is not None:
+            return user.name
+        return f"user-{speaker_id}"
+
+    async def on_recording_stopped(self, *_: object) -> None:
+        try:
+            artifacts = await self.finalize()
+        except Exception as exc:
+            if not self._completion_future.done():
+                self._completion_future.set_exception(exc)
+            return
+        if not self._completion_future.done():
+            self._completion_future.set_result(artifacts)
+
+    async def finalize(self) -> MeetingArtifacts:
+        self.mark_stop_requested()
+        await asyncio.to_thread(self.pipeline.close_and_wait)
+
+        metadata = MeetingMetadata(
+            voice_channel_name=self._voice_channel.name,
+            started_at=self.started_at,
+            ended_at=self.ended_at,
+            participants=self.participants,
+        )
+        transcript_text = self.cache.read_text()
+        sections = await self._summarizer.summarize(
+            metadata=metadata,
+            transcript_text=transcript_text,
+        )
+        markdown = format_markdown_minutes(metadata, sections)
+        self.minutes_path.write_text(markdown, encoding="utf-8")
+        return MeetingArtifacts(
+            metadata=metadata,
+            sections=sections,
+            markdown_text=markdown,
+            minutes_path=self.minutes_path,
+            transcript_path=self.transcript_path,
+            warnings=self.pipeline.warnings,
+        )
+
+
+def create_bot(config: BotConfig) -> discord.Bot:
+    intents = discord.Intents.default()
+    intents.guilds = True
+    intents.members = True
+    intents.voice_states = True
+
+    bot = discord.Bot(intents=intents)
+    transcriber = VoskTranscriber(
+        model_path=config.vosk_model_path,
+        ffmpeg_binary=config.ffmpeg_binary,
+    )
+    summarizer = GeminiSummarizer(
+        api_key=config.gemini_api_key,
+        model_name=config.gemini_model,
+    )
+    sessions: dict[int, MeetingSession] = {}
+    command_kwargs = {"guild_ids": list(config.command_guild_ids)} if config.command_guild_ids else {}
+
+    @bot.event
+    async def on_ready() -> None:
+        LOGGER.info("Logged in as %s", bot.user)
+
+    @bot.slash_command(
+        name="start",
+        description="VC のリアルタイム文字起こしを開始します。",
+        **command_kwargs,
+    )
+    async def start(ctx: discord.ApplicationContext) -> None:
+        if ctx.guild is None:
+            await ctx.respond("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+            return
+        if ctx.guild.id in sessions:
+            await ctx.respond("このサーバーではすでに録音中のセッションがあります。", ephemeral=True)
+            return
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            await ctx.respond("先にボイスチャンネルへ参加してください。", ephemeral=True)
+            return
+        if not isinstance(ctx.author.voice.channel, (discord.VoiceChannel, discord.StageChannel)):
+            await ctx.respond("対応していないチャンネル種別です。", ephemeral=True)
+            return
+
+        voice_channel = ctx.author.voice.channel
+        voice_client = ctx.guild.voice_client
+
+        try:
+            if voice_client is None:
+                voice_client = await voice_channel.connect()
+            elif voice_client.channel.id != voice_channel.id:
+                await voice_client.move_to(voice_channel)
+
+            session = MeetingSession(
+                bot=bot,
+                config=config,
+                guild=ctx.guild,
+                voice_channel=voice_channel,
+                text_channel_id=ctx.channel.id,
+                transcriber=transcriber,
+                summarizer=summarizer,
+            )
+            sessions[ctx.guild.id] = session
+            voice_client.start_recording(session.sink, session.on_recording_stopped, ctx.channel.id)
+        except Exception as exc:
+            sessions.pop(ctx.guild.id, None)
+            if voice_client is not None and voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+            await ctx.respond(f"録音開始に失敗しました: {exc}", ephemeral=True)
+            return
+
+        await ctx.respond(
+            f"`{voice_channel.name}` で議事録作成を開始しました。終了時は `/stop` を実行してください。"
+        )
+
+    @bot.slash_command(
+        name="stop",
+        description="録音を止めて議事録を生成します。",
+        **command_kwargs,
+    )
+    async def stop(ctx: discord.ApplicationContext) -> None:
+        if ctx.guild is None:
+            await ctx.respond("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+            return
+
+        session = sessions.get(ctx.guild.id)
+        if session is None:
+            await ctx.respond("停止できる録音セッションが見つかりません。", ephemeral=True)
+            return
+
+        await ctx.defer(ephemeral=True)
+        voice_client = ctx.guild.voice_client
+        try:
+            if voice_client is not None and getattr(voice_client, "recording", False):
+                session.mark_stop_requested()
+                voice_client.stop_recording()
+
+            artifacts = await session.completion_future
+            if voice_client is not None and voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+            await _send_artifacts(bot=bot, text_channel_id=session.text_channel_id, artifacts=artifacts)
+            warning_text = ""
+            if artifacts.warnings:
+                warning_text = "\n警告: 一部の音声チャンクで文字起こしに失敗しました。README のトラブルシュートを確認してください。"
+            await ctx.followup.send(f"議事録を出力しました。{warning_text}", ephemeral=True)
+        except Exception as exc:
+            LOGGER.exception("Failed to stop recording: %s", exc)
+            if voice_client is not None and voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+            await ctx.followup.send(f"停止処理に失敗しました: {exc}", ephemeral=True)
+        finally:
+            sessions.pop(ctx.guild.id, None)
+
+    return bot
+
+
+async def _send_artifacts(
+    *,
+    bot: discord.Bot,
+    text_channel_id: int,
+    artifacts: MeetingArtifacts,
+) -> None:
+    channel = bot.get_channel(text_channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(text_channel_id)
+
+    transcript_file = discord.File(str(artifacts.transcript_path), filename="transcript_cache.txt")
+    if len(artifacts.markdown_text) <= 2000:
+        await channel.send(artifacts.markdown_text, file=transcript_file)
+        return
+
+    minutes_file = discord.File(str(artifacts.minutes_path), filename="minutes.md")
+    await channel.send(
+        "議事録が 2,000 文字を超えたため、Markdown ファイルとして添付します。",
+        files=[minutes_file, transcript_file],
+    )
+
+
+def _collect_participants(
+    members: list[discord.Member],
+    *,
+    bot_user_id: int | None,
+) -> list[Participant]:
+    participants: list[Participant] = []
+    seen: dict[int, Participant] = {}
+    for member in members:
+        if member.bot or (bot_user_id is not None and member.id == bot_user_id):
+            continue
+        seen[member.id] = Participant(
+            display_name=member.display_name,
+            username=member.name,
+        )
+    participants.extend(seen.values())
+    participants.sort(key=lambda participant: participant.display_name.lower())
+    return participants
