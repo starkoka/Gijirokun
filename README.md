@@ -152,6 +152,16 @@ export PATH="$VOLTA_HOME/bin:$PATH"
 Vosk 公式モデル一覧:
 - [https://alphacephei.com/vosk/models](https://alphacephei.com/vosk/models)
 
+
+高性能な日本語モデル例:
+```
+mkdir -p models
+cd models
+wget https://alphacephei.com/vosk/models/vosk-model-ja-0.22.zip
+unzip vosk-model-ja-0.22.zip
+cd ..
+```
+
 小さめの日本語モデル例:
 
 ```bash
@@ -162,7 +172,8 @@ unzip vosk-model-small-ja-0.22.zip
 cd ..
 ```
 
-デフォルトでは `./models/vosk-model-small-ja-0.22` を参照します。
+
+デフォルトでは 高性能モデルの`./models/vosk-model-ja-0.22` を参照します。
 
 ## Discord Bot の作成手順
 
@@ -254,7 +265,7 @@ cp .env.example .env
 DISCORD_BOT_TOKEN=your_discord_bot_token
 GEMINI_API_KEY=your_gemini_api_key
 GEMINI_MODEL=gemini-3.1-flash-lite-preview
-VOSK_MODEL_PATH=./models/vosk-model-small-ja-0.22
+VOSK_MODEL_PATH=./models/vosk-model-ja-0.22
 FFMPEG_BINARY=ffmpeg
 PYTHON_EXECUTABLE=python3
 BOT_TIMEZONE=Asia/Tokyo
