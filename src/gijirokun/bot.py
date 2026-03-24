@@ -10,7 +10,7 @@ import discord
 from .config import BotConfig
 from .formatting import format_markdown_minutes
 from .gemini import GeminiSummarizer
-from .models import MeetingArtifacts, MeetingMetadata, Participant, TranscriptionJob
+from .models import MeetingArtifacts, MeetingMetadata, Participant, TranscriptEntry, TranscriptionJob
 from .transcriber import TranscriptCache, TranscriptionPipeline, VoskTranscriber, write_pcm_wav
 from .voice import StreamingTranscriptSink
 
@@ -84,6 +84,22 @@ class MeetingSession:
         member = self._guild.get_member(user_id)
         return not bool(member and member.bot)
 
+    def add_text_message(self, author_id: int, created_at: datetime, content: str) -> None:
+        normalized = _normalize_message_content(content)
+        if not normalized:
+            return
+        speaker_name = self.resolve_speaker_name(author_id)
+        if speaker_name is None:
+            return
+        self.pipeline.submit_entry(
+            TranscriptEntry(
+                order=self.next_segment_order(),
+                speaker_name=f"{speaker_name} [text]",
+                started_at=created_at.astimezone(self._config.timezone),
+                text=normalized,
+            )
+        )
+
     def handle_segment(self, order: int, speaker_id: int, started_at: datetime, payload: bytes) -> None:
         speaker_name = self.resolve_speaker_name(speaker_id)
         if speaker_name is None:
@@ -152,6 +168,8 @@ def create_bot(config: BotConfig) -> discord.Bot:
     intents = discord.Intents.default()
     intents.guilds = True
     intents.members = True
+    intents.messages = True
+    intents.message_content = True
     intents.voice_states = True
 
     bot = discord.Bot(intents=intents)
@@ -169,6 +187,25 @@ def create_bot(config: BotConfig) -> discord.Bot:
     @bot.event
     async def on_ready() -> None:
         LOGGER.info("Logged in as %s", bot.user)
+
+    @bot.event
+    async def on_message(message: discord.Message) -> None:
+        if message.author.bot or message.guild is None:
+            return
+
+        session = sessions.get(message.guild.id)
+        if session is None or message.channel.id != session.text_channel_id:
+            return
+
+        content = _build_message_content(message)
+        if content:
+            session.add_text_message(
+                author_id=message.author.id,
+                created_at=message.created_at,
+                content=content,
+            )
+
+        await bot.process_commands(message)
 
     @bot.slash_command(
         name="start",
@@ -300,3 +337,19 @@ def _collect_participants(
     participants.extend(seen.values())
     participants.sort(key=lambda participant: participant.display_name.lower())
     return participants
+
+
+def _build_message_content(message: discord.Message) -> str:
+    chunks: list[str] = []
+    if message.content and message.content.strip():
+        chunks.append(message.content.strip())
+    if message.attachments:
+        attachment_lines = [f"[添付] {attachment.filename}" for attachment in message.attachments]
+        chunks.extend(attachment_lines)
+    return "\n".join(chunks).strip()
+
+
+def _normalize_message_content(content: str) -> str:
+    lines = [line.rstrip() for line in content.splitlines()]
+    normalized = "\n".join(line for line in lines if line.strip())
+    return normalized.strip()

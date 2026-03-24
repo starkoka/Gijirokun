@@ -103,7 +103,7 @@ class TranscriptionPipeline:
     def __init__(self, *, transcriber: VoskTranscriber, cache: TranscriptCache) -> None:
         self._transcriber = transcriber
         self._cache = cache
-        self._jobs: queue.Queue[TranscriptionJob | object] = queue.Queue()
+        self._jobs: queue.Queue[TranscriptionJob | TranscriptEntry | object] = queue.Queue()
         self._buffered_results: dict[int, TranscriptEntry | None] = {}
         self._next_write_order = 1
         self._error: Exception | None = None
@@ -125,6 +125,11 @@ class TranscriptionPipeline:
             raise RuntimeError("Transcription pipeline is already closed.")
         self._jobs.put(job)
 
+    def submit_entry(self, entry: TranscriptEntry) -> None:
+        if self._closed:
+            raise RuntimeError("Transcription pipeline is already closed.")
+        self._jobs.put(entry)
+
     def close_and_wait(self) -> None:
         if self._closed:
             return
@@ -139,12 +144,16 @@ class TranscriptionPipeline:
             try:
                 if item is self._SENTINEL:
                     return
-                assert isinstance(item, TranscriptionJob)
-                self._process_job(item)
+                if isinstance(item, TranscriptionJob):
+                    self._process_job(item)
+                else:
+                    assert isinstance(item, TranscriptEntry)
+                    self._buffered_results[item.order] = item
+                    self._flush_ready_entries()
             except Exception as exc:
                 if self._error is None:
                     self._error = exc
-                if isinstance(item, TranscriptionJob):
+                if isinstance(item, (TranscriptionJob, TranscriptEntry)):
                     self._buffered_results[item.order] = None
                 self._warnings.append(str(exc))
                 LOGGER.exception("Transcription job failed: %s", exc)

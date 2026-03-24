@@ -7,6 +7,7 @@ Discord のボイスチャンネル会話をローカルでリアルタイム文
 - `/start` でコマンド実行者がいる VC へ Bot が参加
 - ユーザーごとの音声ストリームを分離して発言単位でチャンク化
 - 発言終了後に Vosk で非同期文字起こし
+- セッション中に紐づくテキストチャンネルへ投稿されたメッセージも記録
 - `transcript_cache.txt` に `[HH:MM:SS] ユーザー名` 形式で追記
 - `/stop` で Gemini API に要約を依頼し、Markdown 議事録を出力
 - 2,000 文字超の議事録は `minutes.md` として添付
@@ -92,8 +93,9 @@ Discord Developer Portal:
 1. `New Application` でアプリを作成する。
 2. `Bot` タブで Bot を追加し、トークンを発行する。
 3. `Privileged Gateway Intents` で `SERVER MEMBERS INTENT` を有効にする。
-4. `OAuth2 > URL Generator` で `bot` と `applications.commands` を選ぶ。
-5. Bot 権限は最低でも以下を付ける。
+4. 同じく `MESSAGE CONTENT INTENT` も有効にする。
+5. `OAuth2 > URL Generator` で `bot` と `applications.commands` を選ぶ。
+6. Bot 権限は最低でも以下を付ける。
 
 - `View Channels`
 - `Connect`
@@ -102,7 +104,7 @@ Discord Developer Portal:
 - `Use Slash Commands`
 - `Read Message History`
 
-6. 生成された URL で対象サーバーへ招待する。
+7. 生成された URL で対象サーバーへ招待する。
 
 ### 4. Google Cloud プロジェクトを作成し、Gemini API Key を発行する
 
@@ -159,8 +161,10 @@ python3 main.py
 ### `/start`
 
 - コマンド実行者が参加している VC に Bot が入ります。
+- `/start` を実行したテキストチャンネルを、その会議の付属テキストチャンネルとして記録対象にします。
 - 会議開始時刻、VC 名、参加者リストを保持します。
 - ユーザーごとの音声受信を開始します。
+- 同じテキストチャンネルへ投稿された通常メッセージと添付ファイル名を記録します。
 
 ### `/stop`
 
@@ -180,6 +184,11 @@ python3 main.py
 [10:15:30] 山田
 
 では次の議題に入ります。
+
+[10:16:02] 山田 [text]
+
+仕様書のリンクを貼ります
+[添付] spec.md
 ```
 
 ### 参加者一覧
