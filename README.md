@@ -253,7 +253,7 @@ cp .env.example .env
 ```dotenv
 DISCORD_BOT_TOKEN=your_discord_bot_token
 GEMINI_API_KEY=your_gemini_api_key
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.1-flash-lite-preview
 VOSK_MODEL_PATH=./models/vosk-model-small-ja-0.22
 FFMPEG_BINARY=ffmpeg
 PYTHON_EXECUTABLE=python3
