@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from .models import MeetingMetadata, SummarySections
 from .summary_parser import parse_summary_response
@@ -26,11 +27,8 @@ JSON 以外の説明文やコードブロックは出力しないでください
 
 class GeminiSummarizer:
     def __init__(self, *, api_key: str, model_name: str) -> None:
-        genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=SYSTEM_PROMPT,
-        )
+        self._client = genai.Client(api_key=api_key)
+        self._model_name = model_name
 
     async def summarize(
         self,
@@ -46,9 +44,13 @@ class GeminiSummarizer:
         prompt = self._build_prompt(metadata=metadata, transcript_text=transcript_text)
         try:
             response = await asyncio.to_thread(
-                self._model.generate_content,
-                prompt,
-                generation_config={"temperature": 0.2},
+                self._client.models.generate_content,
+                model=self._model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.2,
+                ),
             )
         except Exception as exc:
             return SummarySections(
