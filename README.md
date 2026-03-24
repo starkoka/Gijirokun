@@ -101,6 +101,14 @@ node -v
 npm install
 ```
 
+もし `libsodium-wrappers` 関連の `ERR_MODULE_NOT_FOUND` が出た場合は、古い依存が残っている可能性があります。  
+その場合は一度 `node_modules` を消してから入れ直してください。
+
+```bash
+rm -rf node_modules package-lock.json
+npm install
+```
+
 ### 3. Python 仮想環境を作る
 
 ```bash
@@ -191,14 +199,19 @@ Discord Developer Portal:
    - `bot`
    - `applications.commands`
 3. Bot Permissions で以下を選ぶ
-   - `View Channels`
-   - `Connect`
-   - `Speak`
-   - `Send Messages`
-   - `Attach Files`
-   - `Use Slash Commands`
-   - `Read Message History`
+   - `チャンネルを表示`
+   - `接続`
+   - `発言`
+   - `メッセージを送る`
+   - `ファイルを添付`
+   - `スラッシュコマンドを使用`
+   - `メッセージ履歴を読む`
 4. 生成された URL を開いて Bot をサーバーへ招待する
+
+補足:
+
+- Discord の UI 言語によっては英語表記になる場合があります
+- 対応する英語名はそれぞれ `View Channels`, `Connect`, `Speak`, `Send Messages`, `Attach Files`, `Use Slash Commands`, `Read Message History` です
 
 ## Gemini API Key の発行手順
 
@@ -273,8 +286,6 @@ DISCORD_GUILD_IDS=
 ## 起動方法
 
 ```bash
-source .venv/bin/activate
-source ~/.bashrc
 npm start
 ```
 
@@ -351,6 +362,8 @@ data/sessions/<guildId>_<timestamp>/
 └─ chunks/
 ```
 
+Discord への送信が終わったセッションディレクトリは、自動で削除されます。
+
 ## テスト
 
 ```bash
@@ -392,8 +405,3 @@ node -e "import('@discordjs/voice').then(({ generateDependencyReport }) => conso
 
 - `source .venv/bin/activate` した状態で `pip install -r requirements-transcriber.txt` を実行してください
 - `.env` の `PYTHON_EXECUTABLE` が正しいか確認してください
-
-## 補足
-
-- `.env` はこの書き換えでは触っていません。必要な値は自分で設定してください。
-- 実機での動作確認は行っていません。セットアップ後の `/start` と `/stop`、音声受信、文字起こし精度は手元で確認してください。

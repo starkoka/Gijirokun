@@ -188,6 +188,7 @@ export class MeetingSession {
       markdownText,
       minutesPath: this.minutesPath,
       transcriptPath: this.transcriptPath,
+      sessionDir: this.sessionDir,
       warnings: this.pipeline.warnings,
       autoStopped: Boolean(reason),
       stopReason: reason || null,

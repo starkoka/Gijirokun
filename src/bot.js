@@ -8,12 +8,12 @@ import {
   Routes,
   SlashCommandBuilder,
 } from 'discord.js';
+import fs from 'node:fs/promises';
 import {
   VoiceConnectionStatus,
   entersState,
   joinVoiceChannel,
 } from '@discordjs/voice';
-import sodium from 'libsodium-wrappers';
 import { loadConfig } from './config.js';
 import { GeminiSummarizer } from './gemini.js';
 import { PythonTranscriber } from './python-transcriber.js';
@@ -25,8 +25,6 @@ const COMMAND_DEFINITIONS = [
 ].map((command) => command.toJSON());
 
 export async function startBot() {
-  await sodium.ready;
-
   const config = loadConfig();
   const logger = console;
   const client = new Client({
@@ -100,6 +98,7 @@ export async function startBot() {
       });
       sessions.delete(guildId);
       await sendArtifacts(session.textChannel, artifacts);
+      await cleanupSessionArtifacts(artifacts, logger);
     } catch (error) {
       logger.error(`Failed to auto-stop session for guild ${guildId}:`, error);
     }
@@ -144,6 +143,7 @@ export async function startBot() {
             reason: 'Bot を終了するため、議事録作成を終了しました。',
           });
           await sendArtifacts(session.textChannel, artifacts);
+          await cleanupSessionArtifacts(artifacts, logger);
           sessions.delete(guildId);
         } catch (error) {
           logger.error('Failed to stop session during shutdown:', error);
@@ -256,6 +256,7 @@ async function handleStart({
         `録音対象 VC: \`${voiceChannel.name}\``,
         `記録対象テキストチャンネル: ${textChannel}`,
         '終了するときは `/stop` を実行してください。',
+        '全員が切断することでも終了します。',
       ].join('\n'),
     );
   } catch (error) {
@@ -297,6 +298,7 @@ async function handleStop({ interaction, sessions, logger }) {
     const artifacts = await session.stop({ reason: null });
     sessions.delete(interaction.guildId);
     await sendArtifacts(session.textChannel, artifacts);
+    await cleanupSessionArtifacts(artifacts, logger);
     const warningText = artifacts.warnings.length
       ? '\n注意: 一部の音声チャンクで文字起こしに失敗しました。README のトラブルシュートを確認してください。'
       : '';
@@ -331,6 +333,18 @@ async function sendArtifacts(textChannel, artifacts) {
     content: '議事録が 2,000 文字を超えたため、Markdown ファイルとして添付します。',
     files: [minutesAttachment, transcriptAttachment],
   });
+}
+
+async function cleanupSessionArtifacts(artifacts, logger) {
+  if (!artifacts.sessionDir) {
+    return;
+  }
+
+  try {
+    await fs.rm(artifacts.sessionDir, { recursive: true, force: true });
+  } catch (error) {
+    logger.warn(`Failed to clean up session directory '${artifacts.sessionDir}': ${error.message}`);
+  }
 }
 
 async function registerCommands(client, config) {
