@@ -78,25 +78,26 @@ Bot 本体は `discord.js` / `@discordjs/voice`、文字起こしは Python の 
 
 ## セットアップ
 
-### 1. Node.js 22 系を入れる
+以下のコマンドは、特に断りがない限りこのリポジトリのルートディレクトリで実行する前提です。
 
-Ubuntu の標準 `apt install nodejs` だと古い版が入ることがあるので、`nvm` の利用をおすすめします。
+### 1. Volta で Node.js 22 系を入れる
+
+Ubuntu の標準 `apt install nodejs` だと古い版が入ることがあるので、`volta` で Node.js を固定する前提にしています。
 
 ```bash
 sudo apt update
 sudo apt install -y curl ffmpeg python3 python3-venv unzip
 
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+curl https://get.volta.sh | bash
 source ~/.bashrc
-nvm install 22
-nvm use 22
+volta install node@22
+volta install npm
 node -v
 ```
 
 ### 2. Node 依存を入れる
 
 ```bash
-cd /home/kokastar/project/Gijirokun
 npm install
 ```
 
@@ -107,6 +108,35 @@ python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install --upgrade pip
 pip install -r requirements-transcriber.txt
+```
+
+### 3.1 `venv` 有効化後に `npm` が見えなくなる場合
+
+環境によっては `source .venv/bin/activate` のあとに `volta` の PATH が前面に出てこず、`npm: command not found` になることがあります。  
+その場合は、仮想環境を有効化したあとに `volta` の PATH を読み直してください。
+
+```bash
+source .venv/bin/activate
+source ~/.bashrc
+npm -v
+node -v
+```
+
+それでも解決しない場合は、現在のシェルに明示的に `volta` を通します。
+
+```bash
+export VOLTA_HOME="$HOME/.volta"
+export PATH="$VOLTA_HOME/bin:$PATH"
+source .venv/bin/activate
+npm -v
+node -v
+```
+
+恒久対応にしたい場合は、`~/.bashrc` に次の 2 行があることを確認してください。
+
+```bash
+export VOLTA_HOME="$HOME/.volta"
+export PATH="$VOLTA_HOME/bin:$PATH"
 ```
 
 ### 4. Vosk 日本語モデルを配置する
@@ -243,8 +273,8 @@ DISCORD_GUILD_IDS=
 ## 起動方法
 
 ```bash
-cd /home/kokastar/project/Gijirokun
 source .venv/bin/activate
+source ~/.bashrc
 npm start
 ```
 
