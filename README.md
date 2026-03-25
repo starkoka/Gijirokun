@@ -270,6 +270,7 @@ FFMPEG_BINARY=ffmpeg
 PYTHON_EXECUTABLE=python3
 BOT_TIMEZONE=Asia/Tokyo
 SILENCE_TIMEOUT_SECONDS=1.5
+TRANSCRIBE_TIMEOUT_SECONDS=30
 DISCORD_GUILD_IDS=
 ```
 
@@ -291,6 +292,8 @@ DISCORD_GUILD_IDS=
   - ログと議事録のタイムゾーン
 - `SILENCE_TIMEOUT_SECONDS`
   - 無音判定秒数
+- `TRANSCRIBE_TIMEOUT_SECONDS`
+  - 1 音声チャンクの文字起こし待ち時間上限。超過したチャンクは警告付きでスキップし、後続処理を継続する
 - `DISCORD_GUILD_IDS`
   - 開発用。ここにギルド ID を入れると Slash Command の反映が速い
 
@@ -324,6 +327,10 @@ npm start
 ## 出力仕様
 
 ### 文字起こしログ
+
+- 音声文字起こしは会議終了時にまとめてではなく、会議中に並行処理します
+- 文字起こしワーカーが落ちた場合は自動再起動を試みます
+- 1 チャンクだけ失敗またはタイムアウトしても、そのチャンクをスキップして後続の音声とテキスト記録は継続します
 
 `transcript_cache.txt` に以下の形式で保存します。
 

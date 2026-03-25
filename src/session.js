@@ -47,6 +47,7 @@ export class MeetingSession {
       transcriptPath: this.transcriptPath,
       transcriber,
       timezone: config.timezone,
+      logger,
     });
   }
 

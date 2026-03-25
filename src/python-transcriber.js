@@ -3,32 +3,56 @@ import crypto from 'node:crypto';
 import readline from 'node:readline';
 
 export class PythonTranscriber {
-  constructor({ pythonExecutable, scriptPath, modelPath, ffmpegBinary, logger }) {
+  constructor({
+    pythonExecutable,
+    scriptPath,
+    modelPath,
+    ffmpegBinary,
+    requestTimeoutMs = 30_000,
+    logger,
+  }) {
     this.pythonExecutable = pythonExecutable;
     this.scriptPath = scriptPath;
     this.modelPath = modelPath;
     this.ffmpegBinary = ffmpegBinary;
+    this.requestTimeoutMs = requestTimeoutMs;
     this.logger = logger;
     this.pending = new Map();
     this.process = null;
     this.readyPromise = null;
     this.exitPromise = null;
+    this.startPromise = null;
+    this.restartPromise = null;
+    this.closing = false;
   }
 
   async transcribe(segmentPath) {
-    await this.ensureStarted();
+    const maxAttempts = 2;
 
-    return await new Promise((resolve, reject) => {
-      const requestId = crypto.randomUUID();
-      this.pending.set(requestId, { resolve, reject });
-      this.process.stdin.write(
-        `${JSON.stringify({ type: 'transcribe', id: requestId, segmentPath })}\n`,
-        'utf8',
-      );
-    });
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.ensureStarted();
+        return await this.sendTranscribeRequest(segmentPath);
+      } catch (error) {
+        if (!isRetryableTranscriberError(error) || attempt === maxAttempts || this.closing) {
+          throw error;
+        }
+
+        this.logger.warn(
+          `Retrying transcription after worker failure (${attempt}/${maxAttempts - 1}): ${error.message}`,
+        );
+      }
+    }
+
+    throw createTranscriberError(
+      'Python transcription worker could not process the request.',
+      'WORKER_RETRY_EXHAUSTED',
+    );
   }
 
   async close() {
+    this.closing = true;
+
     if (!this.process) {
       return;
     }
@@ -44,12 +68,39 @@ export class PythonTranscriber {
   }
 
   async ensureStarted() {
+    if (this.closing) {
+      throw createTranscriberError('Python transcription worker is closing.', 'WORKER_CLOSED');
+    }
+
+    if (this.process && !isUsableProcess(this.process)) {
+      await this.exitPromise;
+    }
+
+    if (this.restartPromise) {
+      await this.restartPromise;
+    }
+
     if (this.readyPromise) {
       await this.readyPromise;
       return;
     }
 
-    this.process = spawn(
+    if (this.startPromise) {
+      await this.startPromise;
+      return;
+    }
+
+    this.startPromise = this.startWorker();
+
+    try {
+      await this.startPromise;
+    } finally {
+      this.startPromise = null;
+    }
+  }
+
+  async startWorker() {
+    const workerProcess = spawn(
       this.pythonExecutable,
       [
         '-u',
@@ -69,23 +120,46 @@ export class PythonTranscriber {
       },
     );
 
+    this.process = workerProcess;
     this.exitPromise = new Promise((resolve) => {
-      this.process.once('close', (code, signal) => {
-        const error = new Error(
-          `Python transcription worker exited unexpectedly (code=${code}, signal=${signal}).`,
-        );
+      workerProcess.once('close', (code, signal) => {
+        const error = this.closing
+          ? createTranscriberError(
+              'Python transcription worker closed before the request completed.',
+              'WORKER_CLOSED',
+            )
+          : createTranscriberError(
+              `Python transcription worker exited unexpectedly (code=${code}, signal=${signal}).`,
+              'WORKER_EXITED',
+            );
 
-        for (const { reject } of this.pending.values()) {
-          reject(error);
+        for (const [requestId, deferred] of this.pending.entries()) {
+          if (deferred.workerProcess !== workerProcess) {
+            continue;
+          }
+
+          deferred.reject(error);
+          this.pending.delete(requestId);
         }
-        this.pending.clear();
+
+        if (!this.closing && code !== 0) {
+          this.logger.warn(error.message);
+        }
+
+        if (this.process === workerProcess) {
+          this.process = null;
+          this.readyPromise = null;
+          this.exitPromise = null;
+        }
+
         resolve();
       });
     });
 
     this.readyPromise = new Promise((resolve, reject) => {
-      const stdoutReader = readline.createInterface({ input: this.process.stdout });
-      const stderrReader = readline.createInterface({ input: this.process.stderr });
+      let resolved = false;
+      const stdoutReader = readline.createInterface({ input: workerProcess.stdout });
+      const stderrReader = readline.createInterface({ input: workerProcess.stderr });
 
       stdoutReader.on('line', (line) => {
         if (!line.trim()) {
@@ -101,13 +175,14 @@ export class PythonTranscriber {
         }
 
         if (payload.type === 'ready') {
+          resolved = true;
           resolve();
           return;
         }
 
         if (payload.type === 'result' && payload.id) {
           const deferred = this.pending.get(payload.id);
-          if (!deferred) {
+          if (!deferred || deferred.workerProcess !== workerProcess) {
             return;
           }
 
@@ -126,14 +201,160 @@ export class PythonTranscriber {
         }
       });
 
-      this.process.once('error', reject);
-      this.process.once('close', (code) => {
-        if (code !== 0) {
-          reject(new Error(`Python transcription worker failed to start (exit code ${code}).`));
+      workerProcess.once('error', (error) => {
+        reject(
+          createTranscriberError(
+            `Failed to start Python transcription worker: ${error.message}`,
+            'WORKER_START_FAILED',
+            error,
+          ),
+        );
+      });
+
+      workerProcess.once('close', (code) => {
+        if (!resolved) {
+          reject(
+            createTranscriberError(
+              `Python transcription worker failed to start (exit code ${code}).`,
+              'WORKER_START_FAILED',
+            ),
+          );
         }
       });
     });
 
     await this.readyPromise;
   }
+
+  async sendTranscribeRequest(segmentPath) {
+    const workerProcess = this.process;
+    if (!workerProcess || !isUsableProcess(workerProcess)) {
+      throw createTranscriberError(
+        'Python transcription worker is not running.',
+        'WORKER_NOT_RUNNING',
+      );
+    }
+
+    return await new Promise((resolve, reject) => {
+      const requestId = crypto.randomUUID();
+      let settled = false;
+
+      const finalize = (callback, value) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timeoutId);
+        this.pending.delete(requestId);
+        callback(value);
+      };
+
+      const deferred = {
+        workerProcess,
+        resolve: (text) => {
+          finalize(resolve, text);
+        },
+        reject: (error) => {
+          finalize(reject, error);
+        },
+      };
+
+      const timeoutId = setTimeout(() => {
+        const timeoutError = createTranscriberError(
+          `Transcription request timed out after ${this.requestTimeoutMs} ms.`,
+          'WORKER_TIMEOUT',
+        );
+        deferred.reject(timeoutError);
+        void this.restartWorker(timeoutError);
+      }, this.requestTimeoutMs);
+
+      this.pending.set(requestId, deferred);
+
+      try {
+        workerProcess.stdin.write(
+          `${JSON.stringify({ type: 'transcribe', id: requestId, segmentPath })}\n`,
+          'utf8',
+          (error) => {
+            if (!error) {
+              return;
+            }
+
+            deferred.reject(
+              createTranscriberError(
+                `Failed to send transcription request to Python worker: ${error.message}`,
+                'WORKER_WRITE_FAILED',
+                error,
+              ),
+            );
+            void this.restartWorker(error);
+          },
+        );
+      } catch (error) {
+        deferred.reject(
+          createTranscriberError(
+            `Failed to send transcription request to Python worker: ${error.message}`,
+            'WORKER_WRITE_FAILED',
+            error,
+          ),
+        );
+        void this.restartWorker(error);
+      }
+    });
+  }
+
+  async restartWorker(reason) {
+    if (this.restartPromise) {
+      await this.restartPromise;
+      return;
+    }
+
+    const workerProcess = this.process;
+    if (!workerProcess || this.closing) {
+      return;
+    }
+    const exitPromise = this.exitPromise;
+
+    this.restartPromise = (async () => {
+      this.logger.warn(`Restarting Python transcription worker: ${reason.message}`);
+
+      try {
+        workerProcess.kill('SIGTERM');
+      } catch {
+        // Ignore restart kill failures.
+      }
+
+      await exitPromise;
+    })();
+
+    try {
+      await this.restartPromise;
+    } finally {
+      this.restartPromise = null;
+    }
+  }
+}
+
+function createTranscriberError(message, code, cause) {
+  const error = cause ? new Error(message, { cause }) : new Error(message);
+  error.code = code;
+  return error;
+}
+
+function isRetryableTranscriberError(error) {
+  return [
+    'WORKER_EXITED',
+    'WORKER_NOT_RUNNING',
+    'WORKER_TIMEOUT',
+    'WORKER_WRITE_FAILED',
+  ].includes(error?.code);
+}
+
+function isUsableProcess(workerProcess) {
+  return Boolean(
+    workerProcess &&
+      workerProcess.exitCode === null &&
+      !workerProcess.killed &&
+      !workerProcess.stdin.destroyed,
+  );
 }

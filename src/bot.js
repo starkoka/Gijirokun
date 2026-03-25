@@ -45,6 +45,7 @@ export async function startBot() {
     scriptPath: config.transcriberScriptPath,
     modelPath: config.voskModelPath,
     ffmpegBinary: config.ffmpegBinary,
+    requestTimeoutMs: config.transcribeTimeoutMs,
     logger,
   });
   await transcriber.ensureStarted();

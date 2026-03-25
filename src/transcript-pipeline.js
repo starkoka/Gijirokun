@@ -3,10 +3,11 @@ import path from 'node:path';
 import { formatTranscriptEntry } from './formatting.js';
 
 export class TranscriptPipeline {
-  constructor({ transcriptPath, transcriber, timezone }) {
+  constructor({ transcriptPath, transcriber, timezone, logger }) {
     this.transcriptPath = transcriptPath;
     this.transcriber = transcriber;
     this.timezone = timezone;
+    this.logger = logger;
     this.completedEntries = new Map();
     this.pendingTasks = new Set();
     this.nextWriteOrder = 1;
@@ -30,7 +31,9 @@ export class TranscriptPipeline {
     this.ensureOpen();
     const task = this.processAudioJob(job)
       .catch((error) => {
-        this.warnings.push(error.message);
+        const warning = `音声チャンク ${path.basename(job.segmentPath)} の文字起こしをスキップしました: ${error.message}`;
+        this.warnings.push(warning);
+        this.logger?.warn(warning);
         this.completedEntries.set(job.order, null);
       })
       .finally(async () => {

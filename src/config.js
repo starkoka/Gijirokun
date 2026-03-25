@@ -22,6 +22,10 @@ export function loadConfig() {
       100,
       Math.round(Number.parseFloat(process.env.SILENCE_TIMEOUT_SECONDS || '1.5') * 1000),
     ),
+    transcribeTimeoutMs: Math.max(
+      1000,
+      Math.round(Number.parseFloat(process.env.TRANSCRIBE_TIMEOUT_SECONDS || '30') * 1000),
+    ),
     commandGuildIds: parseGuildIds(process.env.DISCORD_GUILD_IDS || ''),
     pythonExecutable: process.env.PYTHON_EXECUTABLE || 'python3',
     transcriberScriptPath: path.resolve(projectRoot, 'scripts', 'transcribe_worker.py'),

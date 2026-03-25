@@ -10,10 +10,10 @@ import tempfile
 import wave
 from pathlib import Path
 
-from vosk import KaldiRecognizer, Model, SetLogLevel
-
 
 def main() -> int:
+    from vosk import Model, SetLogLevel
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--ffmpeg-binary", default="ffmpeg")
@@ -28,29 +28,31 @@ def main() -> int:
     emit({"type": "ready"})
 
     for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        payload = json.loads(line)
-        if payload.get("type") == "shutdown":
-            return 0
-
-        if payload.get("type") != "transcribe":
-            continue
-
-        request_id = payload["id"]
-        segment_path = Path(payload["segmentPath"])
-
         try:
-            text = transcribe_segment(
-                model=model,
-                segment_path=segment_path,
-                ffmpeg_binary=args.ffmpeg_binary,
-            )
-            emit({"type": "result", "id": request_id, "text": text})
-        except Exception as exc:  # noqa: BLE001
-            emit({"type": "result", "id": request_id, "error": str(exc)})
+            payloads = list(parse_input_payloads(raw_line))
+        except ValueError as exc:
+            warn_stdin(str(exc))
+            continue
+
+        for payload in payloads:
+            if payload.get("type") == "shutdown":
+                return 0
+
+            if payload.get("type") != "transcribe":
+                continue
+
+            request_id = payload["id"]
+            segment_path = Path(payload["segmentPath"])
+
+            try:
+                text = transcribe_segment(
+                    model=model,
+                    segment_path=segment_path,
+                    ffmpeg_binary=args.ffmpeg_binary,
+                )
+                emit({"type": "result", "id": request_id, "text": text})
+            except Exception as exc:  # noqa: BLE001
+                emit({"type": "result", "id": request_id, "error": str(exc)})
 
     return 0
 
@@ -97,6 +99,8 @@ def normalize_audio(*, segment_path: Path, normalized_path: Path, ffmpeg_binary:
 
 
 def transcribe_normalized_wav(*, model: Model, normalized_path: Path) -> str:
+    from vosk import KaldiRecognizer
+
     parts: list[str] = []
     with wave.open(str(normalized_path), "rb") as wav_file:
         recognizer = KaldiRecognizer(model, wav_file.getframerate())
@@ -123,9 +127,52 @@ def extract_text(result_json: str) -> str:
     return str(payload.get("text", "")).strip()
 
 
+def parse_input_payloads(raw_line: str) -> list[dict[str, object]]:
+    line = raw_line.strip()
+    if not line:
+        return []
+
+    decoder = json.JSONDecoder()
+    payloads: list[dict[str, object]] = []
+    index = 0
+
+    while index < len(line):
+        while index < len(line) and line[index].isspace():
+            index += 1
+
+        if index >= len(line):
+            break
+
+        try:
+            payload, index = decoder.raw_decode(line, index)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid JSON command from stdin: {truncate_for_log(line)!r}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            warn_stdin(f"Ignored non-object JSON command from stdin: {payload!r}")
+            continue
+
+        payloads.append(payload)
+
+    return payloads
+
+
+def truncate_for_log(text: str, max_length: int = 200) -> str:
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + "..."
+
+
 def emit(payload: dict[str, object]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def warn_stdin(message: str) -> None:
+    sys.stderr.write(f"{message}\n")
+    sys.stderr.flush()
 
 
 if __name__ == "__main__":
